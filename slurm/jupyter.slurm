@@ -13,7 +13,7 @@
 module purge
 module load cudatoolkit/12.4.1
 
-cd /jukebox/graziano/jack/preference
+cd /jukebox/graziano/jack/newcomb
 source ./venv/bin/activate
 
 jupyter lab --ip=0.0.0.0 --no-browser --allow-root

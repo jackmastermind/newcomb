@@ -15,7 +15,7 @@ module purge
 module load cudatoolkit/12.4.1 # if using GPUs
 
 # initialize project
-cd /jukebox/graziano/jack/preference
+cd /jukebox/graziano/jack/newcomb
 source ./venv/bin/activate
 
 # do whatever your job does! probably running a .py file
