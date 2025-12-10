@@ -16,7 +16,7 @@ stream = client.responses.create(
     reasoning={'effort': 'low'},
     prompt={
         "id": prompt_id,
-        "version": "2",
+        "version": "3",
         "variables": {
             "number": str(number)
         }
@@ -25,7 +25,11 @@ stream = client.responses.create(
     conversation=convo.id
 )
 
-os.remove('output.tsv')
+try:
+    os.remove('output.tsv')
+except FileNotFoundError:
+    pass
+
 for i in range(1, iters + 1):
     textout = ""
     for event in stream:
