@@ -54,7 +54,6 @@ class TrainingArgs:
     per_device_train_batch_size: int = 4
     per_device_eval_batch_size: int = 4
     gradient_accumulation_steps: int = 4
-    max_seq_length: int = 2048
     warmup_ratio: float = 0.03
     lr_scheduler_type: str = "cosine"
 
@@ -253,9 +252,6 @@ def run_sanity_checks(
     sample_text = train_dataset[0]['text']
     tokens = tokenizer.encode(sample_text)
     print(f"    Sample token count: {len(tokens)}")
-    print(f"    Max sequence length: {args.max_seq_length}")
-    if len(tokens) > args.max_seq_length:
-        print(f"    WARNING: Sample exceeds max length (will be truncated)")
 
     # Check sequence length distribution
     print(f"    Checking sequence lengths (first 100 examples)...")
@@ -264,8 +260,6 @@ def run_sanity_checks(
         if i >= 100:
             break
         lengths.append(len(tokenizer.encode(ex['text'])))
-    over_limit = sum(1 for l in lengths if l > args.max_seq_length)
-    print(f"    Over {args.max_seq_length} tokens: {over_limit}/100 sampled")
     print(f"    Length range: {min(lengths)} - {max(lengths)} tokens")
     print(f"    Mean length: {sum(lengths)/len(lengths):.0f} tokens")
 
@@ -361,9 +355,6 @@ def create_trainer(
         # Memory
         gradient_checkpointing=args.gradient_checkpointing,
         bf16=args.bf16,
-
-        # Sequence
-        max_seq_length=args.max_seq_length,
 
         # Completion-only loss (TRL 0.26+)
         # Auto-detects prompt/completion fields in dataset
@@ -475,7 +466,6 @@ def parse_args() -> TrainingArgs:
         learning_rate=cli_args.lr,
         per_device_train_batch_size=cli_args.batch_size,
         gradient_accumulation_steps=cli_args.grad_accum,
-        max_seq_length=cli_args.max_length,
         lora_r=cli_args.lora_r,
         lora_alpha=cli_args.lora_alpha,
         lora_dropout=cli_args.lora_dropout,
@@ -516,8 +506,7 @@ def main():
                 'learning_rate': args.learning_rate,
                 'epochs': args.num_train_epochs,
                 'batch_size': args.per_device_train_batch_size,
-                'grad_accum': args.gradient_accumulation_steps,
-                'max_seq_length': args.max_seq_length,
+                'grad_accum': args.gradient_accumulation_steps
             },
         )
         print(f"[WandB] Initialized: {args.wandb_project}")
