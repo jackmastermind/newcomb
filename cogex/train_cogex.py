@@ -40,6 +40,7 @@ class TrainingArgs:
     # Model
     model_name: str = "Llama-3.1-8B"
     attn_implementation: str = "auto"  # auto, flash_attention_2, sdpa, eager
+    device_map: str | None = "auto"
 
     # Data
     train_file: str = "data/train.json"
@@ -68,6 +69,7 @@ class TrainingArgs:
     # Memory optimization
     bf16: bool = True
     gradient_checkpointing: bool = True
+    gradient_checkpointing_use_reentrant: bool = False
 
     # Logging
     logging_steps: int = 10
@@ -151,6 +153,18 @@ def load_model_and_tokenizer(
         attn_impl = args.attn_implementation
         print(f"[Attention] Using specified: {attn_impl}")
 
+    # Handle device map for distributed training
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    if world_size > 1 and args.device_map == "auto":
+        print(
+            f"[Model] Detected distributed setup (WORLD_SIZE={world_size}); "
+            "disabling device_map='auto' for training"
+        )
+        device_map = None
+    else:
+        device_map = args.device_map
+    print(f"[Model] device_map: {device_map if device_map is not None else 'None'}")
+
     # Load tokenizer
     print("[Model] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -170,10 +184,10 @@ def load_model_and_tokenizer(
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         local_files_only=True,
-        torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
+        dtype=torch.bfloat16 if args.bf16 else torch.float32,
         attn_implementation=attn_impl,
         trust_remote_code=False,
-        device_map="auto",
+        device_map=device_map,
     )
 
     print(f"[Model] Loaded successfully")
@@ -354,7 +368,11 @@ def create_trainer(
 
         # Memory
         gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing_kwargs={
+            "use_reentrant": args.gradient_checkpointing_use_reentrant
+        },
         bf16=args.bf16,
+        ddp_find_unused_parameters=False,
 
         # Completion-only loss (TRL 0.26+)
         # Auto-detects prompt/completion fields in dataset
@@ -408,6 +426,9 @@ def parse_args() -> TrainingArgs:
     parser.add_argument('--attn-impl', type=str, default='auto',
                         choices=['auto', 'flash_attention_2', 'sdpa', 'eager'],
                         help='Attention implementation')
+    parser.add_argument('--device-map', type=str, default='auto',
+                        choices=['auto', 'none'],
+                        help="Device map for model loading ('none' disables map)")
 
     # Data
     parser.add_argument('--train-file', type=str, default='data/train.json',
@@ -430,6 +451,8 @@ def parse_args() -> TrainingArgs:
                         help='Gradient accumulation steps')
     parser.add_argument('--max-length', type=int, default=2048,
                         help='Maximum sequence length')
+    parser.add_argument('--gc-reentrant', action='store_true',
+                        help='Use reentrant gradient checkpointing (default: disabled to avoid DDP+LoRA hook issues)')
 
     # LoRA
     parser.add_argument('--lora-r', type=int, default=16,
@@ -459,6 +482,7 @@ def parse_args() -> TrainingArgs:
     return TrainingArgs(
         model_name=cli_args.model,
         attn_implementation=cli_args.attn_impl,
+        device_map=None if cli_args.device_map == 'none' else cli_args.device_map,
         train_file=cli_args.train_file,
         val_file=cli_args.val_file,
         output_dir=cli_args.output_dir,
@@ -466,6 +490,7 @@ def parse_args() -> TrainingArgs:
         learning_rate=cli_args.lr,
         per_device_train_batch_size=cli_args.batch_size,
         gradient_accumulation_steps=cli_args.grad_accum,
+        gradient_checkpointing_use_reentrant=cli_args.gc_reentrant,
         lora_r=cli_args.lora_r,
         lora_alpha=cli_args.lora_alpha,
         lora_dropout=cli_args.lora_dropout,
@@ -519,6 +544,14 @@ def main():
 
     # Apply LoRA
     model = setup_lora(model, args)
+
+    # Configure gradient checkpointing to use non-reentrant mode by default
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": args.gradient_checkpointing_use_reentrant
+            }
+        )
 
     # Create trainer
     trainer = create_trainer(

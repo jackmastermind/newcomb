@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-gpu=8
-#SBATCH --mem=64G
+#SBATCH --mem=128G
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:2
 #SBATCH --output=%x-%j.out
