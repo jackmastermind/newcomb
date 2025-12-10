@@ -3,6 +3,10 @@
 AGENTS.md 
 CLAUDE.md
 
+# trainset
+data.json
+data/
+
 # slurm
 *.out
 
