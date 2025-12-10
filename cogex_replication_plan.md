@@ -29,7 +29,7 @@ Traditional program synthesis requires fully-defined, compilable code. COGEX all
 ## 2. Dataset Specification
 
 ### 2.1 Source
-The COGEX dataset is derived from the Alpaca instruction-tuning dataset via GPT-4 conversion (August 2023). It has been downloaded to ./data.json .
+The COGEX dataset is derived from the Alpaca instruction-tuning dataset via GPT-4 conversion (August 2023). It has been downloaded to ./data/data.json .
 
 ### 2.2 Dataset Size
 - **Training**: ~52,000 examples (full Alpaca conversion)

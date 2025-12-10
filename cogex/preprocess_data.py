@@ -4,7 +4,7 @@ COGEX Data Preprocessing Script
 Transforms raw data.json into prompt/completion format for completion-only loss training.
 
 Usage:
-    python cogex/preprocess_data.py --input data.json --output-dir data/ --val-size 2000
+    python cogex/preprocess_data.py --input data/data.json --output-dir data/ --val-size 2000
 
 Output format (for TRL DataCollatorForCompletionOnlyLM):
     prompt: "### Instruction\n{instruction}\n### Input\n{input}\n"
@@ -91,7 +91,7 @@ def main():
         description='Preprocess COGEX dataset for finetuning'
     )
     parser.add_argument(
-        '--input', type=str, default='data.json',
+        '--input', type=str, default='data/data.json',
         help='Input JSON file path'
     )
     parser.add_argument(
