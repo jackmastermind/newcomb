@@ -7,7 +7,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --gres=gpu:2
 #SBATCH --output=%x-%j.out
-#SBATCH --mail-user=$USER@princeton.edu
+#SBATCH --mail-user=jt1955@princeton.edu
 #SBATCH --mail-type=ALL
 
 module purge
@@ -25,8 +25,8 @@ OUTPUT_DIR="outputs/cogex-${MODEL}-$(date +%Y%m%d_%H%M%S)"
 
 EPOCHS=5
 LR=3e-4
-BATCH_SIZE=4
-GRAD_ACCUM=4
+BATCH_SIZE=8
+GRAD_ACCUM=2
 MAX_LENGTH=2048
 
 LORA_R=16

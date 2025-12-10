@@ -7,7 +7,7 @@
 #SBATCH --time=8:00:00
 #SBATCH --gres=gpu:2
 #SBATCH --output=%x-%j.out
-#SBATCH --mail-user=$USER@princeton.edu
+#SBATCH --mail-user=jt1955@princeton.edu
 #SBATCH --mail-type=ALL
 
 module purge

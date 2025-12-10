@@ -7,7 +7,7 @@
 #SBATCH --time=0:00:00           # total run time limit (HH:MM:SS)
 #SBATCH --gres=gpu:1             # :1 for 1 GPU, :2 for two.
 #SBATCH --output=%x-%j.out       # Leave this and below lines the same!
-#SBATCH --mail-user=$USER@princeton.edu
+#SBATCH --mail-user=jt1955@princeton.edu
 #SBATCH --mail-type=ALL
 
 # set up node environment
