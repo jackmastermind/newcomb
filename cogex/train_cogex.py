@@ -575,7 +575,7 @@ def main():
     trainer.train()
 
     # Save final model
-    print(f"\n[Save] Saving final model to {args.output_dir}")
+    print(f"\n[Save] Saving model to {args.output_dir}")
     trainer.save_model()
     tokenizer.save_pretrained(args.output_dir)
 
