@@ -1,51 +1,42 @@
 from dotenv import load_dotenv, dotenv_values
-from openai import OpenAI
-from openai.types.responses.response_reasoning_summary_text_delta_event import ResponseReasoningSummaryTextDeltaEvent as ResponseDelta
+from openai import OpenAI, APIStatusError
 import os
+import json
 
 load_dotenv()
-prompt_id = dotenv_values(".env")["PROMPT"]
+prompt_id = dotenv_values(".env")["PROMPT_ABC"]
 client = OpenAI()
-number = 100
+
+number = 102
+assert number % 3 == 0
 iters = 50
 
 convo = client.conversations.create()
-print(convo)
-stream = client.responses.create(
-    model='gpt-5.1',
-    reasoning={'effort': 'low'},
-    prompt={
-        "id": prompt_id,
-        "version": "3",
-        "variables": {
-            "number": str(number)
-        }
-    },
-    stream=True,
-    conversation=convo.id
-)
 
 try:
-    os.remove('output.tsv')
-except FileNotFoundError:
-    pass
+    response = client.responses.create(
+        prompt={
+            "id": prompt_id,
+            "variables": {"n": str(number)}
+        },
+        conversation=convo.id
+    )
+    textout = response.output_text
+    print(textout)
+    with open("data/tmp/fdt-0.json", "w") as f:
+        json.dump({"response": textout}, f)
 
-for i in range(1, iters + 1):
-    textout = ""
-    for event in stream:
-        if hasattr(event, 'delta') and not isinstance(event, ResponseDelta):
-            textout += event.delta
-            print(event.delta, end='')
-    with open('output.tsv', 'a') as file:
-        file.write(textout + '\n')
-    
-    if i < iters:
-        stream = client.responses.create(
-            model="gpt-5.1",
-            reasoning={"effort": "low"},
-            input=f"Good. Generate {str(number)} more rows for the same .tsv. You do not need to output the header.",
-            stream=True,
+    for i in range(1, iters):
+        response = client.responses.create(
+            input=f"Good. Generate {number} more schemas.",
             conversation=convo.id
         )
+        textout = response.output_text
+        print(textout)
+        with open(f"data/tmp/fdt-{i}.json", "w") as f:
+            json.dump({"response": textout}, f)
+
+except APIStatusError as e:
+    print(f"HTTP error {e.status_code}: {e.message}")
 
 print()
