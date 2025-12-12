@@ -2,6 +2,7 @@ from dotenv import load_dotenv, dotenv_values
 from openai import OpenAI
 import argparse
 import json
+import os
 
 load_dotenv()
 prompt_id = dotenv_values(".env")["PROMPT_ABC"]
@@ -21,6 +22,11 @@ with open(themepath) as f:
     themes = json.load(f)
 
 for i, j in enumerate(range(0, len(themes), batch_size)):
+    output_path = f"data/tmp/fdt-ABC-{i}.json"
+    if os.path.exists(output_path):
+        print(f"Skipping chunk {i}: {output_path} already exists")
+        continue
+
     chunk = themes[j:j+batch_size]
 
     # call API
@@ -32,5 +38,5 @@ for i, j in enumerate(range(0, len(themes), batch_size)):
     )
 
     # write to file
-    with open(f"data/tmp/fdt-ABC-{i}.json", "w") as f:
+    with open(output_path, "w") as f:
         f.write(response.output_text)

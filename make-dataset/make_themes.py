@@ -2,6 +2,7 @@ from dotenv import load_dotenv, dotenv_values
 from openai import OpenAI
 import argparse
 import json
+import os
 import re
 
 load_dotenv()
@@ -13,18 +14,22 @@ parser.add_argument("-n", type=int, default=1000, help="number of themes to gene
 args = parser.parse_args()
 
 n = args.n
+output_path = f"data/tmp/themes-{n}.json"
 
-# call API
-response = client.responses.create(
-    prompt={
-        "id": prompt_id,
-        "variables": {"n": str(n)}
-    }
-)
+if os.path.exists(output_path):
+    print(f"Skipping: {output_path} already exists")
+else:
+    # call API
+    response = client.responses.create(
+        prompt={
+            "id": prompt_id,
+            "variables": {"n": str(n)}
+        }
+    )
 
-# remove comments
-textout = re.sub(' *#.*', '', response.output_text)
+    # remove comments
+    textout = re.sub(' *#.*', '', response.output_text)
 
-# write to file
-with open(f"data/tmp/themes-{n}.json", "w") as f:
-    f.write(textout)
+    # write to file
+    with open(output_path, "w") as f:
+        f.write(textout)
