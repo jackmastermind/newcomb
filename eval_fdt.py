@@ -9,14 +9,23 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import re
 import warnings
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from llm import LLM
 
 import torch
-from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from transformers import (
+    LogitsProcessor,
+    LogitsProcessorList,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -42,8 +51,9 @@ def load_json(path: Path) -> dict:
 
 
 def underline(text: str) -> str:
-    """Convert spaces and hyphens to underscores."""
-    return re.sub(r'[\s-]+', '_', text.strip())
+    """Convert to lowercase with underscores, remove non-word chars."""
+    text = re.sub(r'[\s-]+', '_', text.strip().lower())
+    return re.sub(r'[^\w]', '', text)
 
 
 def extract_first_dict(text: str) -> str | None:
@@ -103,6 +113,45 @@ def pad_sequences(
     return torch.tensor(padded), torch.tensor(masks)
 
 
+def count_subsequence(sequence: Sequence[int], pattern: Sequence[int]) -> int:
+    """Count occurrences of pattern in sequence."""
+    if not pattern:
+        return 0
+    count = 0
+    window = len(pattern)
+    for i in range(len(sequence) - window + 1):
+        if list(sequence[i:i + window]) == list(pattern):
+            count += 1
+    return count
+
+
+class StopAfterPatternOccurrences(LogitsProcessor):
+    """Force EOS once a token pattern appears N times per sequence."""
+
+    def __init__(
+        self,
+        pattern: list[int],
+        target_counts: list[int],
+        eos_token_id: int,
+    ) -> None:
+        self.pattern = pattern
+        self.target_counts = target_counts
+        self.eos_token_id = eos_token_id
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:  # noqa: D401
+        # Transform to lists for simple counting; batch size expected to be small.
+        if not self.pattern:
+            return scores
+
+        for idx in range(input_ids.size(0)):
+            seq = input_ids[idx].tolist()
+            occurrences = count_subsequence(seq, self.pattern)
+            if occurrences >= self.target_counts[idx]:
+                scores[idx].fill_(-float("inf"))
+                scores[idx, self.eos_token_id] = 0.0
+        return scores
+
+
 def cogex_formatter(schema: dict, tokenizer: PreTrainedTokenizerBase) -> str:
     """Format a schema for COGEX-style evaluation."""
     return (f"### Instruction\nReturn the action which would maximize your "
@@ -119,32 +168,89 @@ def chat_formatter(schema: dict, tokenizer: PreTrainedTokenizerBase) -> str:
                f"problem.\nactions: {underline(schema['a'][0])}, "
                f"{underline(schema['a'][1])}")
     messages = [{"role": "user", "content": content}]
-    return tokenizer.apply_chat_template(messages, tokenize=False)
+    return tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=False,
+    )
 
 
-def cogex_parser(schema: dict, output: str) -> int:
+def cogex_parser(schema: dict, output: str, use_llm_fallback: bool = True) -> int:
     """Parse COGEX-style output to extract the choice."""
+    # First try hardcoded parsing
     output_match = re.search(r"### Output", output)
+    if output_match:
+        after_output = output[output_match.end():]
+        dict_str = extract_first_dict(after_output)
+        if dict_str:
+            try:
+                output_dict = ast.literal_eval(dict_str)
+                answer = output_dict.get('answer', -1)
+                if isinstance(answer, str):
+                    if underline(answer) == underline(schema['a'][0]):
+                        return 0
+                    elif underline(answer) == underline(schema['a'][1]):
+                        return 1
+            except (SyntaxError, ValueError):
+                pass
+
+    # Fallback to LLM parser
+    if use_llm_fallback:
+        return llm_fallback_parser(output, schema['a'][0], schema['a'][1])
+    return -1
+
+
+# Global for lazy-loaded parser LLM
+_parser_llm: LLM | None = None
+
+
+def get_parser_llm() -> LLM:
+    """Lazy-load Qwen3-4B-Instruct for fallback parsing."""
+    global _parser_llm
+    if _parser_llm is None:
+        from dotenv import load_dotenv
+        from llm import LLM
+        load_dotenv()
+        models_path = os.getenv("MODELS_PATH", "")
+        model_path = os.path.join(models_path, "Qwen3-4B-Instruct")
+        logger.info(f"Loading fallback parser LLM from {model_path}")
+        _parser_llm = LLM(
+            model_path,
+            model_kwargs={
+                "dtype": torch.bfloat16,
+                "attn_implementation": "flash_attention_2",
+            },
+            generation_defaults={"max_new_tokens": 16},
+        )
+    return _parser_llm
+
+
+def llm_fallback_parser(output_text: str, action_0: str, action_1: str) -> int:
+    """Use Qwen3-4B-Instruct to parse ambiguous outputs."""
+    # Extract output dict
+    output_match = re.search(r'output\s*=\s*(\{.*\})', output_text, re.DOTALL)
     if not output_match:
         return -1
 
-    after_output = output[output_match.end():]
-    dict_str = extract_first_dict(after_output)
+    prompt = f"""Given this output from a decision model:
+{output_match.group(1)[:1000]}
 
-    if not dict_str:
-        return -1
+The two actions were:
+Action 0: {action_0}
+Action 1: {action_1}
 
-    try:
-        output_dict = ast.literal_eval(dict_str)
-        answer = output_dict.get('answer', -1)
+Which action was chosen? Reply with a single token: 0, 1, or -1 (if unclear). The wording does not need to be exact, as long as it is obvious which action they intended to say."""
 
-        if answer == underline(schema['a'][0]):
-            return 0
-        elif answer == underline(schema['a'][1]):
-            return 1
-        return -1
-    except (SyntaxError, ValueError):
-        return -1
+    llm = get_parser_llm()
+    response = llm.chat(prompt, use_history=False, save_history=False)
+
+    # Parse response
+    response = response.strip()
+    if response.startswith("0"):
+        return 0
+    elif response.startswith("1"):
+        return 1
+    return -1
 
 
 def chat_parser(schema: dict, output: str) -> int:
@@ -180,6 +286,7 @@ def evaluate_fdt(
     worker_id: int = 0,
     num_workers: int = 1,
     add_special_tokens: bool = False,
+    stop_on_repeated_prompt: bool = False,
     **generation_kwargs: Any,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """
@@ -197,6 +304,8 @@ def evaluate_fdt(
         worker_id: This worker's ID (0-indexed)
         num_workers: Total number of workers
         add_special_tokens: Whether to add special tokens during tokenization
+        stop_on_repeated_prompt: If True, force generation to end once '>>>' appears
+            one more time than in the prompt (used for COGEX loops)
         **generation_kwargs: Additional kwargs for model.generate()
 
     Returns:
@@ -204,6 +313,7 @@ def evaluate_fdt(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
 
     # Load dataset and partition for this worker
     problems = load_dataset(dataset_path)
@@ -223,18 +333,48 @@ def evaluate_fdt(
     # Set up generation defaults
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.eos_token_id is None:
+        tokenizer.eos_token_id = tokenizer.pad_token_id
+
+    tokenizer.padding_side = "left"
+
+    # If model is on a single accelerator, move inputs to that device
+    generation_device: torch.device | None = None
+    device_map = getattr(model, "hf_device_map", None)
+    if device_map:
+        unique_devices = {str(d) for d in device_map.values()}
+        if len(unique_devices) == 1 and not {"cpu", "disk"} & unique_devices:
+            single = next(iter(unique_devices))
+            generation_device = torch.device(f"cuda:{single}") if single.isdigit() else torch.device(single)
+    else:
+        try:
+            param_device = next(model.parameters()).device
+            if param_device.type != "cpu":
+                generation_device = param_device
+        except StopIteration:
+            generation_device = None
 
     gen_defaults = {
         "max_new_tokens": 1024,
         "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
     }
+    user_logits_processor = generation_kwargs.pop("logits_processor", None)
+    base_logits_processors = []
+    if user_logits_processor:
+        if isinstance(user_logits_processor, LogitsProcessorList):
+            base_logits_processors.extend(list(user_logits_processor))
+        elif isinstance(user_logits_processor, list):
+            base_logits_processors.extend(user_logits_processor)
+        else:
+            base_logits_processors.append(user_logits_processor)
     gen_defaults.update(generation_kwargs)
 
-    # Get device from model
-    device = next(model.parameters()).device
+    # Precompute pattern for COGEX early stopping
+    prompt_pattern = tokenizer.encode(">>>", add_special_tokens=False) if stop_on_repeated_prompt else []
 
-    # Collect all tasks: (problem_id, schema_key, schema_data, input_ids)
-    tasks: list[tuple[str, str, dict, list[int]]] = []
+    # Collect all tasks: (problem_id, schema_key, schema_data, input_ids, prompt_pattern_count)
+    tasks: list[tuple[str, str, dict, list[int], int]] = []
 
     for problem in my_problems:
         problem_id = str(problem["id"])
@@ -245,7 +385,8 @@ def evaluate_fdt(
             schema_data = problem["schema"][schema_key]
             formatted = formatter(schema_data, tokenizer)
             tokens = tokenizer.encode(formatted, add_special_tokens=add_special_tokens)
-            tasks.append((problem_id, schema_key, schema_data, tokens))
+            prompt_pattern_count = count_subsequence(tokens, prompt_pattern) if prompt_pattern else 0
+            tasks.append((problem_id, schema_key, schema_data, tokens, prompt_pattern_count))
 
     logger.info(f"Total tasks to process: {len(tasks)}")
 
@@ -264,30 +405,46 @@ def evaluate_fdt(
             tokenizer.pad_token_id,
             padding_side="left",
         )
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
+        if generation_device is not None:
+            input_ids = input_ids.to(generation_device)
+            attention_mask = attention_mask.to(generation_device)
+
+        # Build logits processors (batch-specific) if requested
+        logits_processors = list(base_logits_processors)
+        if stop_on_repeated_prompt and prompt_pattern:
+            target_counts = [t[4] + 1 for t in batch_tasks]
+            logits_processors.append(
+                StopAfterPatternOccurrences(
+                    pattern=prompt_pattern,
+                    target_counts=target_counts,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            )
+        batch_generate_kwargs = dict(gen_defaults)
+        if logits_processors:
+            batch_generate_kwargs["logits_processor"] = LogitsProcessorList(logits_processors)
 
         # Generate
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                **gen_defaults,
+                **batch_generate_kwargs,
             )
 
         # Decode and parse outputs
         prompt_length = input_ids.shape[-1]
 
-        for i, (problem_id, schema_key, schema_data, _) in enumerate(batch_tasks):
+        for i, (problem_id, schema_key, schema_data, _, _) in enumerate(batch_tasks):
             completion_tokens = output_ids[i, prompt_length:]
             output_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
 
             choice = parser(schema_data, output_text)
 
             if choice not in (0, 1):
-                warnings.warn(
-                    f"Parser returned {choice} for problem {problem_id} schema {schema_key}. "
-                    f"Output: {output_text[:100]}..."
+                logger.warning(
+                    f"Parser returned {choice} for problem {problem_id} schema {schema_key}.\n"
+                    f"Output:\n{output_text}\n{'='*60}"
                 )
 
             if problem_id not in results_buffer:
@@ -310,6 +467,83 @@ def evaluate_fdt(
                     problems_since_checkpoint = 0
 
         logger.info(f"Processed batch {batch_start//batch_size + 1}/{(len(tasks) + batch_size - 1)//batch_size}")
+
+    # Retry failed schemas with more tokens
+    failed_tasks: list[tuple[str, str, dict, list[int], int]] = []
+    for problem_id, schemas in completed.items():
+        for schema_key, result in schemas.items():
+            if result["choice"] == -1:
+                # Find the original problem to get schema data
+                for problem in my_problems:
+                    if str(problem["id"]) == problem_id:
+                        schema_data = problem["schema"][schema_key]
+                        formatted = formatter(schema_data, tokenizer)
+                        tokens = tokenizer.encode(formatted, add_special_tokens=add_special_tokens)
+                        prompt_pattern_count = count_subsequence(tokens, prompt_pattern) if prompt_pattern else 0
+                        failed_tasks.append((problem_id, schema_key, schema_data, tokens, prompt_pattern_count))
+                        break
+
+    if failed_tasks:
+        logger.info(f"Retrying {len(failed_tasks)} failed schemas with 2048 tokens")
+        retry_gen_defaults = dict(gen_defaults)
+        retry_gen_defaults["max_new_tokens"] = 2048
+
+        for batch_start in range(0, len(failed_tasks), batch_size):
+            batch_end = min(batch_start + batch_size, len(failed_tasks))
+            batch_tasks = failed_tasks[batch_start:batch_end]
+
+            batch_tokens = [t[3] for t in batch_tasks]
+            input_ids, attention_mask = pad_sequences(
+                batch_tokens,
+                tokenizer.pad_token_id,
+                padding_side="left",
+            )
+            if generation_device is not None:
+                input_ids = input_ids.to(generation_device)
+                attention_mask = attention_mask.to(generation_device)
+
+            logits_processors = list(base_logits_processors)
+            if stop_on_repeated_prompt and prompt_pattern:
+                target_counts = [t[4] + 1 for t in batch_tasks]
+                logits_processors.append(
+                    StopAfterPatternOccurrences(
+                        pattern=prompt_pattern,
+                        target_counts=target_counts,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+                )
+            batch_generate_kwargs = dict(retry_gen_defaults)
+            if logits_processors:
+                batch_generate_kwargs["logits_processor"] = LogitsProcessorList(logits_processors)
+
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **batch_generate_kwargs,
+                )
+
+            prompt_length = input_ids.shape[-1]
+
+            for i, (problem_id, schema_key, schema_data, _, _) in enumerate(batch_tasks):
+                completion_tokens = output_ids[i, prompt_length:]
+                output_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
+
+                choice = parser(schema_data, output_text)
+
+                if choice not in (0, 1):
+                    logger.warning(
+                        f"Retry still failed for problem {problem_id} schema {schema_key}.\n"
+                        f"Output:\n{output_text}\n{'='*60}"
+                    )
+
+                # Update the result
+                completed[problem_id][schema_key] = {
+                    "choice": choice,
+                    "text": output_text,
+                }
+
+            logger.info(f"Processed retry batch {batch_start//batch_size + 1}/{(len(failed_tasks) + batch_size - 1)//batch_size}")
 
     # Final save
     results_path = output_dir / f"results_{worker_id}.json"
@@ -347,6 +581,11 @@ def main():
         "--model-type", type=str, choices=["cogex", "chat"], required=True,
         help="Model type: 'cogex' for COGEX-trained models, 'chat' for chat models"
     )
+    parser.add_argument(
+        "--single-gpu",
+        action="store_true",
+        help="Force model onto a single GPU if available (avoids sharding/offload)",
+    )
 
     args = parser.parse_args()
 
@@ -359,13 +598,19 @@ def main():
 
     logger.info(f"Loading model from {model_path}")
 
+    use_single_gpu = args.single_gpu and torch.cuda.is_available()
+    if args.single_gpu and not torch.cuda.is_available():
+        logger.warning("single-gpu requested but CUDA not available; falling back to auto device_map")
+
     # Load model and tokenizer
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map="auto",
+        device_map=None if use_single_gpu else "auto",
         dtype=torch.bfloat16,
         attn_implementation="flash_attention_2"
     )
+    if use_single_gpu:
+        model = model.to("cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Load LoRA adapter if specified
@@ -395,6 +640,7 @@ def main():
         worker_id=args.worker_id,
         num_workers=args.num_workers,
         add_special_tokens=(args.model_type == "cogex"),
+        stop_on_repeated_prompt=(args.model_type == "cogex"),
     )
 
 

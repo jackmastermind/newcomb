@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=eval-fdt
-#SBATCH --array=0-19
+#SBATCH --array=0-51
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-gpu=8
@@ -19,12 +19,14 @@ source ./venv/bin/activate
 
 python eval_fdt.py \
     --model "${MODEL:-Llama-3.1-8B}" \
-    --dataset data/fdt.json \
-    --output-dir data/tmp \
+    --model-type "${MODEL_TYPE:?Set MODEL_TYPE to 'cogex' or 'chat'}" \
+    --dataset "${DATASET:-data/fdt.json}" \
+    --output-dir "${OUTPUT_DIR:-data/tmp}" \
     --batch-size "${BATCH_SIZE:-16}" \
-    --checkpoint-every 10 \
+    --checkpoint-every "${CHECKPOINT_EVERY:-10}" \
     --worker-id "$SLURM_ARRAY_TASK_ID" \
     --num-workers "$SLURM_ARRAY_TASK_COUNT" \
+    --single-gpu \
     ${LORA_PATH:+--lora-path "$LORA_PATH"}
 
 EXIT_CODE=$?
