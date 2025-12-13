@@ -6,6 +6,7 @@ Supports batch inference, SLURM parallelization, and checkpointing.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -38,6 +39,28 @@ def load_json(path: Path) -> dict:
     """Load data from JSON file."""
     with open(path, "r") as f:
         return json.load(f)
+
+
+def underline(text: str) -> str:
+    """Convert spaces and hyphens to underscores."""
+    return re.sub(r'[\s-]+', '_', text.strip())
+
+
+def extract_first_dict(text: str) -> str | None:
+    """Extract the first balanced {...} from text."""
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    depth = 0
+    for i, char in enumerate(text[start:], start):
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
 
 
 def partition_problems(
@@ -82,49 +105,74 @@ def pad_sequences(
 
 def cogex_formatter(schema: dict, tokenizer: PreTrainedTokenizerBase) -> str:
     """Format a schema for COGEX-style evaluation."""
-    return (f"### Instruction\nReturn the number (0 or 1) of the action which "
-            f"would maximize your personal expected value in this game theory "
-            f"problem.\n### Input\n{schema['description']} (action 0: "
-            f"{schema['a'][0]}; action 1: {schema['a'][1]})\n### Code\n")
+    return (f"### Instruction\nReturn the action which would maximize your "
+            f"personal expected value in this game theory problem.\n"
+            f"### Input\n{schema['description']}\n"
+            f"actions: {underline(schema['a'][0])}, {underline(schema['a'][1])}\n"
+            f"### Code\n")
 
 
 def chat_formatter(schema: dict, tokenizer: PreTrainedTokenizerBase) -> str:
     """Format a schema for chat-style evaluation."""
-    content = (f"{schema['description']}\n\nReturn the number (0 or 1) of the "
-               f"action which would maximize your personal expected value in this "
-               f"game theory problem. (action 0: {schema['a'][0]}, action 1: "
-               f"{schema['a'][1]})")
+    content = (f"{schema['description']}\n\nReturn the action which would "
+               f"maximize your personal expected value in this game theory "
+               f"problem.\nactions: {underline(schema['a'][0])}, "
+               f"{underline(schema['a'][1])}")
     messages = [{"role": "user", "content": content}]
     return tokenizer.apply_chat_template(messages, tokenize=False)
 
 
-def cogex_parser(output: str) -> int:
+def cogex_parser(schema: dict, output: str) -> int:
     """Parse COGEX-style output to extract the choice."""
-    match = re.search(r"(?<=### Output\s*)\{.+\}", output, flags=re.DOTALL)
-    if not match:
+    output_match = re.search(r"### Output", output)
+    if not output_match:
+        return -1
+
+    after_output = output[output_match.end():]
+    dict_str = extract_first_dict(after_output)
+
+    if not dict_str:
         return -1
 
     try:
-        output_dict = json.loads(match.group())
-        return output_dict['answer']
-    except (KeyError, json.JSONDecodeError):
+        output_dict = ast.literal_eval(dict_str)
+        answer = output_dict.get('answer', -1)
+
+        if answer == underline(schema['a'][0]):
+            return 0
+        elif answer == underline(schema['a'][1]):
+            return 1
+        return -1
+    except (SyntaxError, ValueError):
         return -1
 
 
-def chat_parser(output: str) -> int:
+def chat_parser(schema: dict, output: str) -> int:
     """Parse chat-style output to extract the choice."""
-    # strip out chain of thought
+    # Strip out chain of thought
     output = re.sub(r'<think>.+</think>', '', output, flags=re.DOTALL)
-    if (num := re.search('0|1', output)):
-        return int(num.group())
-    return -1
+
+    action0 = underline(schema['a'][0])
+    action1 = underline(schema['a'][1])
+
+    pos0 = output.find(action0)
+    pos1 = output.find(action1)
+
+    if pos0 == -1 and pos1 == -1:
+        return -1
+    elif pos0 == -1:
+        return 1
+    elif pos1 == -1:
+        return 0
+    else:
+        return 0 if pos0 < pos1 else 1
 
 
 def evaluate_fdt(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
     formatter: Callable[[dict, PreTrainedTokenizerBase], str],
-    parser: Callable[[str], int],
+    parser: Callable[[dict, str], int],
     dataset_path: str | Path = "data/fdt.json",
     output_dir: str | Path = "data/tmp",
     batch_size: int = 16,
@@ -141,7 +189,7 @@ def evaluate_fdt(
         model: HuggingFace model (AutoModelForCausalLM or PeftModelForCausalLM)
         tokenizer: HuggingFace tokenizer
         formatter: Function that takes schema dict and tokenizer, returns str
-        parser: Function that takes output str and returns 0, 1, or -1
+        parser: Function that takes schema dict and output str, returns 0, 1, or -1
         dataset_path: Path to fdt.json
         output_dir: Directory for checkpoints and results
         batch_size: Number of prompts to process at once
@@ -185,8 +233,8 @@ def evaluate_fdt(
     # Get device from model
     device = next(model.parameters()).device
 
-    # Collect all tasks: (problem_id, schema_key, input_ids)
-    tasks: list[tuple[str, str, list[int]]] = []
+    # Collect all tasks: (problem_id, schema_key, schema_data, input_ids)
+    tasks: list[tuple[str, str, dict, list[int]]] = []
 
     for problem in my_problems:
         problem_id = str(problem["id"])
@@ -197,7 +245,7 @@ def evaluate_fdt(
             schema_data = problem["schema"][schema_key]
             formatted = formatter(schema_data, tokenizer)
             tokens = tokenizer.encode(formatted, add_special_tokens=add_special_tokens)
-            tasks.append((problem_id, schema_key, tokens))
+            tasks.append((problem_id, schema_key, schema_data, tokens))
 
     logger.info(f"Total tasks to process: {len(tasks)}")
 
@@ -210,7 +258,7 @@ def evaluate_fdt(
         batch_tasks = tasks[batch_start:batch_end]
 
         # Pad batch
-        batch_tokens = [t[2] for t in batch_tasks]
+        batch_tokens = [t[3] for t in batch_tasks]
         input_ids, attention_mask = pad_sequences(
             batch_tokens,
             tokenizer.pad_token_id,
@@ -230,11 +278,11 @@ def evaluate_fdt(
         # Decode and parse outputs
         prompt_length = input_ids.shape[-1]
 
-        for i, (problem_id, schema_key, _) in enumerate(batch_tasks):
+        for i, (problem_id, schema_key, schema_data, _) in enumerate(batch_tasks):
             completion_tokens = output_ids[i, prompt_length:]
             output_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
 
-            choice = parser(output_text)
+            choice = parser(schema_data, output_text)
 
             if choice not in (0, 1):
                 warnings.warn(
@@ -315,7 +363,8 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map="auto",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2"
     )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
 
