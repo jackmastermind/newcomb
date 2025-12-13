@@ -126,7 +126,7 @@ def chat_formatter(schema: dict, tokenizer: PreTrainedTokenizerBase) -> str:
     content = (f"{schema['description']}\n\nReturn the action which would "
                f"maximize your personal expected value in this game theory "
                f"problem.\nactions: {underline(schema['a'][0])}, "
-               f"{underline(schema['a'][1])}")
+               f"{underline(schema['a'][1])} /no_think")
     messages = [{"role": "user", "content": content}]
     return tokenizer.apply_chat_template(
         messages,
@@ -187,13 +187,15 @@ def get_parser_llm() -> LLM:
 
 def llm_fallback_parser(output_text: str, action_0: str, action_1: str) -> int:
     """Use Qwen3-4B-Instruct to parse ambiguous outputs."""
-    # Extract output dict
+    # Extract output dict if present (COGEX format), otherwise use full text (chat format)
     output_match = re.search(r'output\s*=\s*(\{.*\})', output_text, re.DOTALL)
-    if not output_match:
-        return -1
+    if output_match:
+        text_to_parse = output_match.group(1)[:1000]
+    else:
+        text_to_parse = output_text[:1000]
 
     prompt = f"""Given this output from a decision model:
-{output_match.group(1)[:1000]}
+{text_to_parse}
 
 The two actions were:
 Action 0: {action_0}
@@ -213,7 +215,7 @@ Which action was chosen? Reply with a single token: 0, 1, or -1 (if unclear). Th
     return -1
 
 
-def chat_parser(schema: dict, output: str) -> int:
+def chat_parser(schema: dict, output: str, use_llm_fallback: bool = True) -> int:
     """Parse chat-style output to extract the choice."""
     # Strip out chain of thought
     output = re.sub(r'<think>.+</think>', '', output, flags=re.DOTALL)
@@ -221,10 +223,13 @@ def chat_parser(schema: dict, output: str) -> int:
     action0 = underline(schema['a'][0])
     action1 = underline(schema['a'][1])
 
-    pos0 = output.find(action0)
-    pos1 = output.find(action1)
+    pos0 = output.rfind(action0)
+    pos1 = output.rfind(action1)
 
     if pos0 == -1 and pos1 == -1:
+        # Fallback to LLM parser
+        if use_llm_fallback:
+            return llm_fallback_parser(output, schema['a'][0], schema['a'][1])
         return -1
     elif pos0 == -1:
         return 1
@@ -246,6 +251,8 @@ def evaluate_fdt(
     worker_id: int = 0,
     num_workers: int = 1,
     add_special_tokens: bool = False,
+    max_new_tokens: int = 1024,
+    retry_max_new_tokens: int = 2048,
     **generation_kwargs: Any,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """
@@ -312,7 +319,7 @@ def evaluate_fdt(
             generation_device = None
 
     gen_defaults = {
-        "max_new_tokens": 1024,
+        "max_new_tokens": max_new_tokens,
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,
     }
@@ -425,9 +432,9 @@ def evaluate_fdt(
                         break
 
     if failed_tasks:
-        logger.info(f"Retrying {len(failed_tasks)} failed schemas with 2048 tokens")
+        logger.info(f"Retrying {len(failed_tasks)} failed schemas with {retry_max_new_tokens} tokens")
         retry_gen_defaults = dict(gen_defaults)
-        retry_gen_defaults["max_new_tokens"] = 2048
+        retry_gen_defaults["max_new_tokens"] = retry_max_new_tokens
 
         for batch_start in range(0, len(failed_tasks), batch_size):
             batch_end = min(batch_start + batch_size, len(failed_tasks))
@@ -550,13 +557,17 @@ def main():
         logger.info(f"Loading LoRA adapter from {args.lora_path}")
         model = PeftModel.from_pretrained(model, args.lora_path)
 
-    # Select formatter and parser based on model type
+    # Select formatter, parser, and token limits based on model type
     if args.model_type == "cogex":
         formatter = cogex_formatter
         output_parser = cogex_parser
+        max_new_tokens = 1024
+        retry_max_new_tokens = 2048
     else:  # chat
         formatter = chat_formatter
         output_parser = chat_parser
+        max_new_tokens = 1024
+        retry_max_new_tokens = 2048
 
     # Run evaluation
     evaluate_fdt(
@@ -571,6 +582,8 @@ def main():
         worker_id=args.worker_id,
         num_workers=args.num_workers,
         add_special_tokens=(args.model_type == "cogex"),
+        max_new_tokens=max_new_tokens,
+        retry_max_new_tokens=retry_max_new_tokens,
     )
 
 
