@@ -302,14 +302,20 @@ def evaluate_fdt(
 
     tokenizer.padding_side = "left"
 
-    # If model is on a single accelerator, move inputs to that device
+    # Determine device for input tensors
     generation_device: torch.device | None = None
     device_map = getattr(model, "hf_device_map", None)
     if device_map:
-        unique_devices = {str(d) for d in device_map.values()}
-        if len(unique_devices) == 1 and not {"cpu", "disk"} & unique_devices:
-            single = next(iter(unique_devices))
-            generation_device = torch.device(f"cuda:{single}") if single.isdigit() else torch.device(single)
+        # For sharded models, use the device of the input embeddings
+        try:
+            generation_device = model.get_input_embeddings().weight.device
+        except AttributeError:
+            # Fallback: use first non-CPU device from device map
+            for device in device_map.values():
+                if str(device) not in ("cpu", "disk"):
+                    dev_str = str(device)
+                    generation_device = torch.device(f"cuda:{dev_str}" if dev_str.isdigit() else dev_str)
+                    break
     else:
         try:
             param_device = next(model.parameters()).device
@@ -550,6 +556,14 @@ def main():
     if use_single_gpu:
         model = model.to("cuda")
     tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    # Validate chat template for chat mode
+    if args.model_type == "chat" and not tokenizer.chat_template:
+        raise ValueError(
+            f"Model '{args.model}' does not have a chat_template. "
+            "Chat mode requires an instruct/chat model (e.g., Llama-2-7b-chat-hf, "
+            "Llama-3.1-8B-Instruct). Use --model-type cogex for base models."
+        )
 
     # Load LoRA adapter if specified
     if args.lora_path:
